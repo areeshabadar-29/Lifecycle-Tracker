@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getDb } from '../db.js';
+import { getDb, sql } from '../db.js';
 
 const router = Router();
 
@@ -7,45 +7,50 @@ const router = Router();
 router.get('/providers', async (_req, res): Promise<void> => {
   try {
     const db = await getDb();
-    const [rows] = await db.query<any[]>(
-      'SELECT provider_id, name, service_type, phone, address, city FROM service_providers ORDER BY name ASC'
-    );
-    res.json({ providers: rows });
+    const result = await db.request().query(`
+      SELECT provider_id, name, service_type, phone, address, city 
+      FROM dbo.service_providers 
+      ORDER BY name ASC
+    `);
+    res.json({ providers: result.recordset });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch service providers.' });
   }
 });
 
-// Get known issues (optionally filtered by category_id)
+// Get known issues (optionally filtered by category_id using named parameter @category_id)
 router.get('/issues', async (req, res): Promise<void> => {
   try {
     const { category_id } = req.query;
     const db = await getDb();
+    const request = db.request();
 
-    let sql = `
+    let sqlText = `
       SELECT 
         ki.issue_id, ki.category_id, ki.title, ki.symptoms, ki.severity,
         c.name as category_name
-      FROM known_issues ki
-      JOIN categories c ON ki.category_id = c.category_id
+      FROM dbo.known_issues ki
+      JOIN dbo.categories c ON ki.category_id = c.category_id
     `;
-    const params: any[] = [];
 
     if (category_id) {
-      sql += ' WHERE ki.category_id = ? OR c.parent_category_id = ?';
-      params.push(Number(category_id), Number(category_id));
+      sqlText += ' WHERE ki.category_id = @category_id OR c.parent_category_id = @category_id';
+      request.input('category_id', sql.Int, Number(category_id));
     }
 
-    sql += ' ORDER BY ki.title ASC';
+    sqlText += ' ORDER BY ki.title ASC';
 
-    const [issues] = await db.query<any[]>(sql, params);
+    const issuesRes = await request.query(sqlText);
 
-    // Fetch causes for these issues
-    const [causes] = await db.query<any[]>(
-      'SELECT cause_id, issue_id, cause_description, suggested_fix, difficulty, estimated_cost, needs_professional FROM issue_causes ORDER BY estimated_cost ASC'
-    );
+    // Fetch causes for issues
+    const causesRes = await db.request().query(`
+      SELECT cause_id, issue_id, cause_description, suggested_fix, difficulty, estimated_cost, needs_professional 
+      FROM dbo.issue_causes 
+      ORDER BY estimated_cost ASC
+    `);
 
-    const issuesWithCauses = issues.map((issue) => {
+    const causes = causesRes.recordset;
+    const issuesWithCauses = issuesRes.recordset.map((issue) => {
       return {
         ...issue,
         causes: causes.filter((c) => c.issue_id === issue.issue_id)
@@ -62,10 +67,12 @@ router.get('/issues', async (req, res): Promise<void> => {
 router.get('/organizations', async (_req, res): Promise<void> => {
   try {
     const db = await getDb();
-    const [rows] = await db.query<any[]>(
-      'SELECT organization_id, user_id, name, org_type, registration_no, contact, city FROM organizations ORDER BY name ASC'
-    );
-    res.json({ organizations: rows });
+    const result = await db.request().query(`
+      SELECT organization_id, user_id, name, org_type, registration_no, contact, city 
+      FROM dbo.organizations 
+      ORDER BY name ASC
+    `);
+    res.json({ organizations: result.recordset });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch organizations.' });
   }

@@ -34,7 +34,7 @@ app.get('/api/status', async (_req: Request, res: Response) => {
     const db = await getDb();
     res.json({
       status: 'ok',
-      engine: db.isFallback ? 'sql.js (Local Fallback)' : 'MySQL 8 (mysql2)',
+      engine: db.isFallback ? 'Local T-SQL Engine (Preview Mode)' : 'Microsoft SQL Server (mssql / tedious)',
       details: db.status,
       timestamp: new Date().toISOString()
     });

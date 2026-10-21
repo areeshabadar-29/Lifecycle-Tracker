@@ -1,97 +1,214 @@
-import mysql, { Pool, PoolConnection } from 'mysql2/promise';
+import sql from 'mssql';
 import dotenv from 'dotenv';
-import fs from 'fs';
-import path from 'path';
 import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import { initializeFallbackSchemaAndSeed } from './fallback-schema.js';
 
 dotenv.config();
 
-export interface QueryResult {
-  insertId: number;
-  affectedRows: number;
+export interface DbResult<T = any> {
+  recordset: T[];
+  rowsAffected: number[];
 }
 
-export interface DbConnection {
-  beginTransaction(): Promise<void>;
-  query<T = any>(sql: string, params?: any[]): Promise<[T, any]>;
+export interface IDbRequest {
+  input(name: string, typeOrValue: any, value?: any): IDbRequest;
+  query<T = any>(command: string): Promise<DbResult<T>>;
+}
+
+export interface IDbTransaction {
+  begin(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
-  release(): void;
+  request(): IDbRequest;
 }
 
-export interface DatabaseService {
-  query<T = any>(sql: string, params?: any[]): Promise<[T, any]>;
-  getConnection(): Promise<DbConnection>;
+export interface IDatabaseService {
   isFallback: boolean;
   status: string;
+  request(): IDbRequest;
+  transaction(): IDbTransaction;
 }
 
-class SqlJsFallbackAdapter implements DatabaseService {
+// ----------------------------------------------------------------------------
+// Real Microsoft SQL Server Adapter (mssql / tedious driver)
+// ----------------------------------------------------------------------------
+class MssqlAdapter implements IDatabaseService {
+  public isFallback = false;
+  public status = 'Connected to Microsoft SQL Server via tedious driver';
+
+  constructor(private pool: sql.ConnectionPool) {}
+
+  request(): IDbRequest {
+    const req = this.pool.request();
+    return {
+      input(name: string, typeOrValue: any, value?: any) {
+        if (value !== undefined) {
+          req.input(name, typeOrValue, value);
+        } else {
+          req.input(name, typeOrValue);
+        }
+        return this;
+      },
+      async query<T = any>(command: string): Promise<DbResult<T>> {
+        const res = await req.query<T>(command);
+        return {
+          recordset: res.recordset || [],
+          rowsAffected: res.rowsAffected || [0]
+        };
+      }
+    };
+  }
+
+  transaction(): IDbTransaction {
+    const tx = new sql.Transaction(this.pool);
+    return {
+      async begin() {
+        await tx.begin();
+      },
+      async commit() {
+        await tx.commit();
+      },
+      async rollback() {
+        await tx.rollback();
+      },
+      request(): IDbRequest {
+        const req = new sql.Request(tx);
+        return {
+          input(name: string, typeOrValue: any, value?: any) {
+            if (value !== undefined) {
+              req.input(name, typeOrValue, value);
+            } else {
+              req.input(name, typeOrValue);
+            }
+            return this;
+          },
+          async query<T = any>(command: string): Promise<DbResult<T>> {
+            const res = await req.query<T>(command);
+            return {
+              recordset: res.recordset || [],
+              rowsAffected: res.rowsAffected || [0]
+            };
+          }
+        };
+      }
+    };
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Local T-SQL Emulation Adapter for Zero-Config Preview Mode
+// ----------------------------------------------------------------------------
+class MssqlFallbackAdapter implements IDatabaseService {
   private sqlDb!: SqlJsDatabase;
   public isFallback = true;
-  public status = 'Initializing Fallback In-Memory Engine';
+  public status = 'Running with local T-SQL engine (SQL Server not reachable on host)';
   private inTransaction = false;
 
   async init() {
     const SQL = await initSqlJs();
     this.sqlDb = new SQL.Database();
-    this.status = 'Running with SQLite/sql.js local engine (MySQL not detected)';
-    this.setupSchemaAndSeed();
+    initializeFallbackSchemaAndSeed(this.sqlDb);
+    console.log('✅ Fallback T-SQL database initialized and seeded with lifecycle history.');
   }
 
-  private setupSchemaAndSeed() {
-    try {
-      initializeFallbackSchemaAndSeed(this.sqlDb);
-      console.log('✅ Fallback database initialized and seeded with lifecycle history.');
-    } catch (err) {
-      console.error('Error initializing fallback schema/seed:', err);
+  // Translates T-SQL query with OUTPUT INSERTED.<id>, TOP, etc., for the local engine
+  private executeTSql<T = any>(command: string, params: Record<string, any>): DbResult<T> {
+    let sqlText = command.trim();
+
+    // Check if this is an INSERT with OUTPUT INSERTED.<col>
+    const outputMatch = sqlText.match(/INSERT\s+INTO\s+([a-zA-Z0-9_\.\[\]]+)\s*\(([^\)]+)\)\s+OUTPUT\s+INSERTED\.([a-zA-Z0-9_]+)\s+VALUES\s*\(([^\)]+)\)/i);
+    let outputCol: string | null = null;
+    let targetTable: string | null = null;
+
+    if (outputMatch) {
+      targetTable = outputMatch[1].replace(/[\[\]]/g, '').replace(/^dbo\./i, '');
+      outputCol = outputMatch[3];
+      // Strip OUTPUT INSERTED.<col> for sqlite engine execution
+      sqlText = sqlText.replace(/OUTPUT\s+INSERTED\.[a-zA-Z0-9_]+\s+/i, '');
     }
-  }
 
-  async query<T = any>(sql: string, params: any[] = []): Promise<[T, any]> {
-    // Normalization of parameters for sql.js
-    const normalizedParams = params.map(p => {
-      if (p === undefined) return null;
-      if (typeof p === 'boolean') return p ? 1 : 0;
-      return p;
+    // Strip dbo. schema prefix for local SQLite engine
+    sqlText = sqlText.replace(/\bdbo\./gi, '');
+
+    // Convert TOP in subqueries: (SELECT TOP 1 ... ORDER BY ...) -> (SELECT ... ORDER BY ... LIMIT 1)
+    sqlText = sqlText.replace(/\(SELECT\s+TOP\s+(\d+)\s+([^)]+)\)/gi, '(SELECT $2 LIMIT $1)');
+
+    // Convert outer SELECT TOP <n> to LIMIT <n>
+    const topMatch = sqlText.match(/^SELECT\s+TOP\s+(\d+)\s+/i);
+    let topLimit: number | null = null;
+    if (topMatch) {
+      topLimit = parseInt(topMatch[1], 10);
+      sqlText = sqlText.replace(/^SELECT\s+TOP\s+\d+\s+/i, 'SELECT ');
+    }
+
+    // Replace @params with values safely
+    const orderedParams: any[] = [];
+    const normalizedSql = sqlText.replace(/@([a-zA-Z0-9_]+)/g, (_match, name) => {
+      const val = params[name];
+      orderedParams.push(val === undefined ? null : val);
+      return '?';
     });
 
-    const isSelect = /^\s*(SELECT|PRAGMA|SHOW)/i.test(sql);
+    let finalSql = normalizedSql;
+    if (topLimit !== null && !/LIMIT\s+\d+/i.test(finalSql)) {
+      finalSql += ` LIMIT ${topLimit}`;
+    }
+
+    const isSelect = /^\s*SELECT/i.test(finalSql);
 
     if (isSelect) {
-      const stmt = this.sqlDb.prepare(sql);
-      stmt.bind(normalizedParams);
+      const stmt = this.sqlDb.prepare(finalSql);
+      stmt.bind(orderedParams);
       const rows: any[] = [];
       while (stmt.step()) {
         rows.push(stmt.getAsObject());
       }
       stmt.free();
-      return [rows as unknown as T, null];
+      return { recordset: rows as T[], rowsAffected: [rows.length] };
     } else {
-      this.sqlDb.run(sql, normalizedParams);
-      // Query last inserted ID and affected rows
-      const lastIdRes = this.sqlDb.exec('SELECT last_insert_rowid() as id, changes() as affected');
-      let insertId = 0;
-      let affectedRows = 0;
-      if (lastIdRes.length && lastIdRes[0].values.length) {
-        insertId = (lastIdRes[0].values[0][0] as number) || 0;
-        affectedRows = (lastIdRes[0].values[0][1] as number) || 0;
+      this.sqlDb.run(finalSql, orderedParams);
+
+      if (outputCol && targetTable) {
+        // Query last inserted row's requested output column
+        const lastIdRes = this.sqlDb.exec(`SELECT ${outputCol} FROM ${targetTable} ORDER BY ${outputCol} DESC LIMIT 1`);
+        let insertedId = 0;
+        if (lastIdRes.length && lastIdRes[0].values.length) {
+          insertedId = Number(lastIdRes[0].values[0][0]) || 0;
+        }
+        const recordset = [{ [outputCol]: insertedId }] as unknown as T[];
+        return { recordset, rowsAffected: [1] };
       }
-      const result: QueryResult = { insertId, affectedRows };
-      return [result as unknown as T, null];
+
+      const changesRes = this.sqlDb.exec('SELECT changes() as affected');
+      let affected = 1;
+      if (changesRes.length && changesRes[0].values.length) {
+        affected = Number(changesRes[0].values[0][0]) || 0;
+      }
+      return { recordset: [] as T[], rowsAffected: [affected] };
     }
   }
 
-  async getConnection(): Promise<DbConnection> {
+  request(): IDbRequest {
+    const params: Record<string, any> = {};
+    const self = this;
+
+    return {
+      input(name: string, typeOrValue: any, value?: any) {
+        params[name] = value !== undefined ? value : typeOrValue;
+        return this;
+      },
+      async query<T = any>(command: string): Promise<DbResult<T>> {
+        return self.executeTSql<T>(command, params);
+      }
+    };
+  }
+
+  transaction(): IDbTransaction {
     const self = this;
     return {
-      async beginTransaction() {
+      async begin() {
         self.sqlDb.run('BEGIN TRANSACTION;');
         self.inTransaction = true;
-      },
-      async query<T = any>(sql: string, params: any[] = []) {
-        return self.query<T>(sql, params);
       },
       async commit() {
         if (self.inTransaction) {
@@ -105,87 +222,56 @@ class SqlJsFallbackAdapter implements DatabaseService {
           self.inTransaction = false;
         }
       },
-      release() {
-        // no-op for in-memory single connection
+      request(): IDbRequest {
+        return self.request();
       }
     };
   }
 }
 
-class MySQLAdapter implements DatabaseService {
-  public isFallback = false;
-  public status = 'Connected to MySQL 8';
+let activeDb: IDatabaseService | null = null;
 
-  constructor(private pool: Pool) {}
-
-  async query<T = any>(sql: string, params: any[] = []): Promise<[T, any]> {
-    return this.pool.query(sql, params) as Promise<[T, any]>;
-  }
-
-  async getConnection(): Promise<DbConnection> {
-    const conn = await this.pool.getConnection();
-    return {
-      async beginTransaction() {
-        await conn.beginTransaction();
-      },
-      async query<T = any>(sql: string, params: any[] = []) {
-        return conn.query(sql, params) as Promise<[T, any]>;
-      },
-      async commit() {
-        await conn.commit();
-      },
-      async rollback() {
-        await conn.rollback();
-      },
-      release() {
-        conn.release();
-      }
-    };
-  }
-}
-
-let activeDb: DatabaseService;
-
-export async function getDb(): Promise<DatabaseService> {
+export async function getDb(): Promise<IDatabaseService> {
   if (activeDb) return activeDb;
 
-  const dbHost = process.env.DB_HOST;
-  const dbUser = process.env.DB_USER;
-  const dbPassword = process.env.DB_PASSWORD;
-  const dbName = process.env.DB_NAME || 'lifecycle_tracker';
-  const dbPort = parseInt(process.env.DB_PORT || '3306', 10);
+  const server = process.env.DB_SERVER;
+  const port = parseInt(process.env.DB_PORT || '1433', 10);
+  const user = process.env.DB_USER;
+  const password = process.env.DB_PASSWORD;
+  const database = process.env.DB_NAME || 'lifecycle_tracker';
+  const encrypt = process.env.DB_ENCRYPT === 'true';
+  const trustServerCertificate = process.env.DB_TRUST_SERVER_CERTIFICATE !== 'false';
 
-  // If DB_HOST is set, try MySQL2 first
-  if (dbHost) {
+  if (server) {
     try {
-      console.log(`🔌 Attempting MySQL 8 connection to ${dbHost}:${dbPort} as ${dbUser}...`);
-      const pool = mysql.createPool({
-        host: dbHost,
-        port: dbPort,
-        user: dbUser,
-        password: dbPassword,
-        database: dbName,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        connectTimeout: 3000
+      console.log(`🔌 Attempting Microsoft SQL Server connection to ${server}:${port} (Database: ${database})...`);
+      const pool = await sql.connect({
+        server,
+        port,
+        user,
+        password,
+        database,
+        options: {
+          encrypt,
+          trustServerCertificate,
+          connectTimeout: 3000
+        }
       });
 
-      // Test connection
-      const [rows] = await pool.query('SELECT 1 as test');
-      console.log('✅ Successfully connected to MySQL 8 server!');
-      activeDb = new MySQLAdapter(pool);
+      console.log('✅ Successfully connected to Microsoft SQL Server via tedious!');
+      activeDb = new MssqlAdapter(pool);
       return activeDb;
     } catch (err: any) {
-      console.warn(`⚠️ MySQL connection to ${dbHost} failed (${err.code || err.message}). Switching to pure SQL.js fallback.`);
+      console.warn(`⚠️ Microsoft SQL Server connection to ${server} failed: ${err.message}. Engaging local T-SQL engine.`);
     }
   } else {
-    console.log('ℹ️ DB_HOST not specified in .env. Initializing local SQL engine.');
+    console.log('ℹ️ DB_SERVER not configured in .env. Initializing local T-SQL engine.');
   }
 
-  // Fallback to pure SQLite/sql.js
-  const fallback = new SqlJsFallbackAdapter();
+  const fallback = new MssqlFallbackAdapter();
   await fallback.init();
   activeDb = fallback;
   return activeDb;
 }
+
+export { sql };

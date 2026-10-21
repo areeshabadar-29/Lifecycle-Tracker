@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { getDb } from '../db.js';
+import { getDb, sql } from '../db.js';
 import { generateToken, authenticate, AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -25,11 +25,15 @@ router.post('/register', async (req, res): Promise<void> => {
     }
 
     const assignedRole = role === 'admin' ? 'admin' : 'user';
+    const cleanEmail = email.trim().toLowerCase();
 
     const db = await getDb();
-    // Check if email already registered
-    const [existing] = await db.query<any[]>('SELECT user_id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
-    if (existing && existing.length > 0) {
+    // Check if email already registered using T-SQL TOP 1 and named @email
+    const checkRes = await db.request()
+      .input('email', sql.NVarChar(150), cleanEmail)
+      .query('SELECT TOP 1 user_id FROM dbo.users WHERE email = @email');
+
+    if (checkRes.recordset && checkRes.recordset.length > 0) {
       res.status(409).json({ error: 'An account with this email address already exists.' });
       return;
     }
@@ -38,15 +42,24 @@ router.post('/register', async (req, res): Promise<void> => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    const [insertResult] = await db.query(
-      'INSERT INTO users (full_name, email, password_hash, phone, city, role) VALUES (?, ?, ?, ?, ?, ?)',
-      [full_name.trim(), email.trim().toLowerCase(), passwordHash, phone || null, city || null, assignedRole]
-    );
+    // T-SQL INSERT with OUTPUT INSERTED.user_id
+    const insertRes = await db.request()
+      .input('full_name', sql.NVarChar(100), full_name.trim())
+      .input('email', sql.NVarChar(150), cleanEmail)
+      .input('password_hash', sql.NVarChar(255), passwordHash)
+      .input('phone', sql.NVarChar(30), phone || null)
+      .input('city', sql.NVarChar(80), city || null)
+      .input('role', sql.NVarChar(20), assignedRole)
+      .query(`
+        INSERT INTO dbo.users (full_name, email, password_hash, phone, city, role)
+        OUTPUT INSERTED.user_id
+        VALUES (@full_name, @email, @password_hash, @phone, @city, @role)
+      `);
 
-    const newUserId = insertResult.insertId;
+    const newUserId = insertRes.recordset[0].user_id;
     const token = generateToken({
       userId: newUserId,
-      email: email.trim().toLowerCase(),
+      email: cleanEmail,
       fullName: full_name.trim(),
       role: assignedRole
     });
@@ -56,7 +69,7 @@ router.post('/register', async (req, res): Promise<void> => {
       token,
       user: {
         userId: newUserId,
-        email: email.trim().toLowerCase(),
+        email: cleanEmail,
         fullName: full_name.trim(),
         role: assignedRole,
         phone: phone || null,
@@ -79,18 +92,24 @@ router.post('/login', async (req, res): Promise<void> => {
       return;
     }
 
+    const cleanEmail = email.trim().toLowerCase();
     const db = await getDb();
-    const [rows] = await db.query<any[]>(
-      'SELECT user_id, full_name, email, password_hash, phone, city, role FROM users WHERE email = ?',
-      [email.trim().toLowerCase()]
-    );
 
-    if (!rows || rows.length === 0) {
+    // T-SQL parameterized query using TOP 1 and named @email
+    const userRes = await db.request()
+      .input('email', sql.NVarChar(150), cleanEmail)
+      .query(`
+        SELECT TOP 1 user_id, full_name, email, password_hash, phone, city, role
+        FROM dbo.users
+        WHERE email = @email
+      `);
+
+    if (!userRes.recordset || userRes.recordset.length === 0) {
       res.status(401).json({ error: 'Invalid email or password.' });
       return;
     }
 
-    const user = rows[0];
+    const user = userRes.recordset[0];
     const passwordMatch = await bcrypt.compare(password, user.password_hash);
 
     if (!passwordMatch) {
@@ -127,30 +146,35 @@ router.post('/login', async (req, res): Promise<void> => {
 router.get('/me', authenticate, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const db = await getDb();
-    const [rows] = await db.query<any[]>(
-      'SELECT user_id, full_name, email, phone, city, role, created_at FROM users WHERE user_id = ?',
-      [req.user!.userId]
-    );
+    const result = await db.request()
+      .input('user_id', sql.Int, req.user!.userId)
+      .query(`
+        SELECT TOP 1 user_id, full_name, email, phone, city, role, created_at
+        FROM dbo.users
+        WHERE user_id = @user_id
+      `);
 
-    if (!rows || rows.length === 0) {
+    if (!result.recordset || result.recordset.length === 0) {
       res.status(404).json({ error: 'User not found.' });
       return;
     }
 
-    res.json({ user: rows[0] });
+    res.json({ user: result.recordset[0] });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to retrieve profile.' });
   }
 });
 
-// List users for selection (for transfers, buyers, donors)
+// List users for selection
 router.get('/users', async (_req, res): Promise<void> => {
   try {
     const db = await getDb();
-    const [rows] = await db.query<any[]>(
-      'SELECT user_id, full_name, email, city, role FROM users ORDER BY full_name ASC'
-    );
-    res.json({ users: rows });
+    const result = await db.request().query(`
+      SELECT user_id, full_name, email, city, role
+      FROM dbo.users
+      ORDER BY full_name ASC
+    `);
+    res.json({ users: result.recordset });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to load users list.' });
   }

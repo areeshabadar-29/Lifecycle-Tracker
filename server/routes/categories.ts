@@ -6,9 +6,13 @@ const router = Router();
 router.get('/', async (_req, res): Promise<void> => {
   try {
     const db = await getDb();
-    const [categories] = await db.query<any[]>(
-      'SELECT category_id, name, parent_category_id FROM categories ORDER BY parent_category_id IS NOT NULL, name ASC'
-    );
+    const result = await db.request().query(`
+      SELECT category_id, name, parent_category_id 
+      FROM dbo.categories 
+      ORDER BY CASE WHEN parent_category_id IS NULL THEN 0 ELSE 1 END, name ASC
+    `);
+
+    const categories = result.recordset;
 
     // Build hierarchy tree
     const categoryMap = new Map<number, any>();
