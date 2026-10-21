@@ -1,0 +1,8 @@
+{
+  "name": "Second-Hand Lifecycle Tracker",
+  "description": "A comprehensive provenance and lifecycle tracker (Carfax for everyday items) recording ownership history, repairs, condition scores, resales, and donations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
